@@ -1132,17 +1132,18 @@ def generate_3d_replicate(image_path, output_glb_path, model_id, nouns=None):
         return res
 
 def analyze_image_gemini_direct(image_path, negations, language=None):
-    """Google Gemini API を直接呼び出して画像分析（無料枠使用）。"""
+    """Google Gemini API を直接呼び出して画像分析（新SDK: google-genai）。"""
     import re
-    import google.generativeai as genai
+    from google import genai as google_genai
+    from google.genai import types as genai_types
     from PIL import Image as PILImage
 
     lang_name = language["name"] if language else "English"
     console.print(f"  [bold magenta]🔍 Gemini API 直接 具象分析 [{lang_name}]...[/]")
     log.info(f"[GeminiDirect] 分析中 (lang={lang_name})")
 
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    client = google_genai.Client(api_key=GEMINI_API_KEY)
+    VISION_MODEL = os.getenv("GEMINI_VISION_MODEL", "gemini-2.5-flash-lite")
 
     negation_lower = {n.lower().strip() for n in negations}
     negation_words = set()
@@ -1223,11 +1224,12 @@ INSTRUCTIONS:
             ) as progress:
                 progress.add_task("gemini_direct", total=None)
                 pil_img = PILImage.open(image_path)
-                response = model.generate_content(
-                    [prompt, pil_img],
-                    generation_config=genai.GenerationConfig(
+                response = client.models.generate_content(
+                    model=VISION_MODEL,
+                    contents=[prompt, pil_img],
+                    config=genai_types.GenerateContentConfig(
                         temperature=min(0.6 + (attempt - 1) * 0.3, 1.5),
-                        max_output_tokens=1000,
+                        max_output_tokens=1200,
                     ),
                 )
             text = response.text.strip()
