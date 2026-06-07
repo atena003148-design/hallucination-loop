@@ -71,6 +71,8 @@ log = logging.getLogger("hallucination")
 # ── Configuration ────────────────────────────────────────────
 BLENDER_PATH = os.getenv("BLENDER_PATH", "blender").strip()
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+COLAB_SERVER_URL = os.getenv("COLAB_SERVER_URL", "").strip().rstrip("/")
 # Gemini 3 Flash for image analysis (replaces Llama 3.2 Vision)
 REPLICATE_VISION_MODEL = os.getenv("REPLICATE_VISION_MODEL", "google/gemini-3-flash").strip()
 # Nano Banana 2 (Gemini 3.1 Flash Image) for image generation (replaces FLUX)
@@ -409,8 +411,25 @@ signal.signal(signal.SIGTERM, _signal_handler)
 def validate_environment():
     """Fail fast if critical dependencies are missing."""
     errors = []
-    if not REPLICATE_API_TOKEN:
-        errors.append("REPLICATE_API_TOKEN が .env に設定されていません。")
+
+    # バックエンド判定
+    using_colab   = bool(COLAB_SERVER_URL)
+    using_gemini  = bool(GEMINI_API_KEY)
+    using_replicate = bool(REPLICATE_API_TOKEN)
+
+    if not using_colab and not using_replicate:
+        errors.append(
+            "画像生成・3D生成のバックエンドが設定されていません。\n"
+            "  Colabを使う場合: .env に COLAB_SERVER_URL を設定してください。\n"
+            "  Replicateを使う場合: .env に REPLICATE_API_TOKEN を設定してください。"
+        )
+    if not using_gemini and not using_replicate:
+        errors.append(
+            "画像分析のバックエンドが設定されていません。\n"
+            "  Gemini直接を使う場合: .env に GEMINI_API_KEY を設定してください（無料: aistudio.google.com）\n"
+            "  Replicateを使う場合: .env に REPLICATE_API_TOKEN を設定してください。"
+        )
+
     blender = shutil.which(BLENDER_PATH) or (Path(BLENDER_PATH).exists() if BLENDER_PATH != "blender" else False)
     if not blender:
         errors.append(f"Blender が見つかりません: '{BLENDER_PATH}' — .env の BLENDER_PATH を確認してください。")
@@ -424,12 +443,23 @@ def validate_environment():
             log.error(e)
         sys.exit(1)
 
-    console.print(f"[green]✓[/] Replicate: [cyan]Gemini 3 Flash, Nano Banana 2 & SDS ({len(REPLICATE_SDS_MODELS)} models)[/]")
-    console.print(f"[green]✓[/] Blender:   [cyan]{BLENDER_PATH}[/]")
-    console.print(f"[green]✓[/] Output:    [cyan]{OUTPUT_DIR.resolve()}[/]")
-    log.info(f"Replicate: Gemini 3 Flash ({REPLICATE_VISION_MODEL}), Nano Banana 2 ({REPLICATE_IMAGE_MODEL}), SDS Models: {REPLICATE_SDS_MODELS}")
-    log.info(f"Blender: {BLENDER_PATH}")
-    log.info(f"Output:  {OUTPUT_DIR.resolve()}")
+    if using_colab:
+        console.print(f"[green]✓[/] 画像/3D生成: [cyan]Colab サーバー ({COLAB_SERVER_URL})[/]")
+        log.info(f"Colab server: {COLAB_SERVER_URL}")
+    else:
+        console.print(f"[green]✓[/] 画像/3D生成: [cyan]Replicate (Nano Banana 2, {len(REPLICATE_SDS_MODELS)} SDS models)[/]")
+        log.info(f"Replicate image={REPLICATE_IMAGE_MODEL}, SDS={REPLICATE_SDS_MODELS}")
+
+    if using_gemini:
+        console.print(f"[green]✓[/] 画像分析:    [cyan]Google Gemini API 直接 (無料枠)[/]")
+        log.info("Vision: Gemini API direct")
+    else:
+        console.print(f"[green]✓[/] 画像分析:    [cyan]Replicate ({REPLICATE_VISION_MODEL})[/]")
+        log.info(f"Vision: Replicate {REPLICATE_VISION_MODEL}")
+
+    console.print(f"[green]✓[/] Blender:      [cyan]{BLENDER_PATH}[/]")
+    console.print(f"[green]✓[/] Output:       [cyan]{OUTPUT_DIR.resolve()}[/]")
+    log.info(f"Blender: {BLENDER_PATH}, Output: {OUTPUT_DIR.resolve()}")
 
 
 # ── Negation File I/O ────────────────────────────────────────
@@ -1101,6 +1131,244 @@ def generate_3d_replicate(image_path, output_glb_path, model_id, nouns=None):
         # res は実際のファイルパス(str) or None
         return res
 
+def analyze_image_gemini_direct(image_path, negations, language=None):
+    """Google Gemini API を直接呼び出して画像分析（無料枠使用）。"""
+    import re
+    import google.generativeai as genai
+    from PIL import Image as PILImage
+
+    lang_name = language["name"] if language else "English"
+    console.print(f"  [bold magenta]🔍 Gemini API 直接 具象分析 [{lang_name}]...[/]")
+    log.info(f"[GeminiDirect] 分析中 (lang={lang_name})")
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+
+    negation_lower = {n.lower().strip() for n in negations}
+    negation_words = set()
+    for neg in negation_lower:
+        negation_words.add(neg)
+        for word in neg.split():
+            if len(word) >= 3:
+                negation_words.add(word)
+
+    def _is_negated(noun):
+        n_lower = noun.lower().strip()
+        if n_lower in negation_lower:
+            return True
+        if any(neg in n_lower for neg in negation_lower):
+            return True
+        if any(n_lower in neg for neg in negation_lower):
+            return True
+        noun_words = {w for w in n_lower.split() if len(w) >= 3}
+        if noun_words & negation_words:
+            return True
+        return False
+
+    def _parse_nouns(text):
+        all_nouns = []
+        if '[' in text and ']' in text:
+            try:
+                start = text.find('[')
+                end = text.rfind(']') + 1
+                parsed = json.loads(text[start:end])
+                if isinstance(parsed, list):
+                    text = ",".join(str(p) for p in parsed)
+            except Exception:
+                pass
+        for line in text.strip().split("\n"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line = re.sub(r'^\d+[.)\-]\s*', '', line)
+            line = re.sub(r'[*_`]+', '', line)
+            parts = re.split(r'[,،、·]', line)
+            parts = [n.strip().strip('"').strip("'").strip('.') for n in parts if n.strip()]
+            parts = [n for n in parts if 1 < len(n) < 50 and not any(c in n for c in ['(', ')', '[', ']', ':'])]
+            all_nouns.extend(parts)
+        return all_nouns
+
+    BATCH_REQUEST = 40
+    TARGET_COUNT  = 3
+    lang_instruction = ""
+    if language:
+        lang_instruction = f"\n5. IMPORTANT: Output ALL {BATCH_REQUEST} nouns {language['instruction']}."
+
+    prompt = f"""Analyze this 3D object backview render image.
+
+INSTRUCTIONS:
+1. Carefully observe the silhouette, protrusions, indentations, and surface flow of this shape.
+2. Brainstorm concrete nouns that this shape could possibly resemble.
+3. To ensure variety, you MUST provide EXACTLY 5 items for EACH of the following 8 categories (Total {BATCH_REQUEST} items):
+   - Animals or Creatures
+   - Tools or Weapons
+   - Plants or Fungi
+   - Foods or Ingredients
+   - Vehicles or Machines
+   - Buildings or Architecture
+   - Clothing or Accessories
+   - Everyday Objects
+4. Output your response STRICTLY as a single flat JSON array of strings. No markdown, no explanations.{lang_instruction}"""
+
+    for attempt in range(1, 4):
+        if _shutdown_requested:
+            return None
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn(f"  [cyan]Gemini API 推論中... (試行 {attempt}/3)[/]"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                progress.add_task("gemini_direct", total=None)
+                pil_img = PILImage.open(image_path)
+                response = model.generate_content(
+                    [prompt, pil_img],
+                    generation_config=genai.GenerationConfig(
+                        temperature=min(0.6 + (attempt - 1) * 0.3, 1.5),
+                        max_output_tokens=1000,
+                    ),
+                )
+            text = response.text.strip()
+            if not text:
+                continue
+            raw_nouns = _parse_nouns(text)
+            valid_nouns = list(dict.fromkeys(n for n in raw_nouns if not _is_negated(n)))
+            console.print(f"  [dim]取得: {len(raw_nouns)}個 → フィルタ後: {len(valid_nouns)}個[/]")
+            if len(valid_nouns) >= TARGET_COUNT:
+                selected = random.sample(valid_nouns, TARGET_COUNT)
+                console.print(f"  [bold green]✓ 結果: {', '.join(selected)}[/]")
+                log.info(f"[GeminiDirect] 結果: {selected}")
+                return selected
+            elif valid_nouns:
+                return valid_nouns
+        except Exception as e:
+            log.warning(f"[GeminiDirect] エラー: {e} (試行 {attempt}/3)")
+            console.print(f"  [yellow]⚠ {e}[/]")
+            time.sleep(5)
+
+    console.print("  [red]✗ Gemini API 分析失敗[/]")
+    return None
+
+
+def generate_image_colab(nouns, negations, output_path, input_image_path=None):
+    """Colab サーバーに FLUX.1-schnell で画像生成を依頼する。"""
+    mode = "img2img" if input_image_path else "txt2img"
+    console.print(f"  [bold blue]🎨 Colab FLUX.1-schnell {mode}...[/]")
+    log.info(f"[ColabImage] {mode} 開始")
+
+    nouns_str = ", ".join(nouns)
+    core_neg  = [n for n in negations if n in INITIAL_NEGATIONS and n not in nouns]
+    other_neg = [n for n in negations if n not in INITIAL_NEGATIONS and n not in nouns]
+    neg_str   = ", ".join(core_neg + other_neg[-40:])
+
+    if input_image_path:
+        prompt = (
+            f"Transform this 3D object render to embody {nouns_str}. "
+            f"STRONGLY maintain the exact core silhouette of the input image. "
+            f"Surface details and textures express {nouns_str}. "
+            f"Standalone sculpture on pure solid studio background. "
+            f"Avoid: altering silhouette, {neg_str}, abstract, geometric, text."
+        )
+    else:
+        prompt = (
+            f"A standalone highly detailed photorealistic 3D sculpture on a pure solid neutral grey background. "
+            f"The entire surface is a fusion of {nouns_str}. "
+            f"Soft natural lighting, clay-like material. "
+            f"Do NOT include: complex background, {neg_str}, abstract, geometric, text."
+        )
+
+    def _call():
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn(f"  [cyan]Colab FLUX {mode} 生成中...[/]"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                progress.add_task("colab_img", total=None)
+                data   = {"prompt": prompt, "num_steps": 4, "strength": 0.6}
+                files  = {}
+                opened = None
+                if input_image_path:
+                    opened = open(input_image_path, "rb")
+                    files["input_image"] = opened
+                resp = requests.post(
+                    f"{COLAB_SERVER_URL}/generate_image",
+                    data=data, files=files, timeout=180,
+                )
+                if opened:
+                    opened.close()
+            resp.raise_for_status()
+            tmp = Path(str(output_path) + ".tmp")
+            tmp.write_bytes(resp.content)
+            tmp.replace(output_path)
+            if is_valid_file(output_path, min_bytes=1000):
+                console.print(f"  [green]✓[/] 画像保存完了: [dim]{output_path.name}[/]")
+                return True
+        except Exception as e:
+            log.warning(f"[ColabImage] エラー: {e}")
+            console.print(f"  [yellow]⚠ Colab 画像生成エラー: {e}[/]")
+        return None
+
+    return retry(_call, "ColabImage") is not None
+
+
+def generate_3d_colab(image_path, output_path, nouns=None):
+    """Colab サーバーに TripoSR で 3D 生成を依頼する。OBJ ファイルパスを返す。"""
+    console.print("  [bold green]🧊 Colab TripoSR Image-to-3D...[/]")
+    log.info("[Colab3D] TripoSR 開始")
+
+    # 画像を90度回転して送信（ハルシネーション促進）
+    rotated_path = Path(image_path).with_name("mutated_rotated.png")
+    try:
+        from PIL import Image as PILImage
+        with PILImage.open(image_path) as img:
+            img.rotate(-90, expand=True).save(rotated_path, format="PNG")
+        console.print("  [dim]↻ 画像を90°回転して送信[/]")
+    except Exception as e:
+        log.error(f"[Colab3D] 画像回転エラー: {e}")
+        return None
+
+    def _call():
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("  [cyan]Colab TripoSR 3D生成中...[/]"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                progress.add_task("colab_3d", total=None)
+                with open(rotated_path, "rb") as f:
+                    resp = requests.post(
+                        f"{COLAB_SERVER_URL}/generate_3d",
+                        files={"image": f},
+                        timeout=300,
+                    )
+            resp.raise_for_status()
+
+            tmp = output_path.with_suffix(".tmp")
+            tmp.write_bytes(resp.content)
+
+            actual_format = _detect_3d_format(tmp)
+            final_path    = output_path.with_suffix(f".{actual_format}")
+            tmp.replace(final_path)
+
+            if is_valid_file(final_path, min_bytes=100):
+                console.print(f"  [green]✓[/] 3Dメッシュ保存完了: [dim]{final_path.name}[/]")
+                log.info(f"[Colab3D] 完了: {final_path.name}")
+                return str(final_path)
+        except Exception as e:
+            log.warning(f"[Colab3D] エラー: {e}")
+            console.print(f"  [yellow]⚠ Colab 3D生成エラー: {e}[/]")
+        return None
+
+    return retry(_call, "Colab3D")
+
+
 def render_blender(glb_path, output_front_path, output_back_path):
     """Render front and back views with Blender headless, showing spinner progress."""
     console.print("  [bold yellow]📷 Blender レンダリング...[/]")
@@ -1535,25 +1803,32 @@ def main():
         print_pipeline_progress(1)
         img_generated = False
 
-        # ★ 部分成功キャッシュ: 前回失敗サイクルの画像が残っていればスキップ
+        # ★ 部分成功キャッシュ
         if is_valid_file(mutated_path, min_bytes=1000):
-            console.print("  [green]✓[/] 既存の mutated.png を再利用します (APIコール節約)")
+            console.print("  [green]✓[/] 既存の mutated.png を再利用します")
             log.info("[Step 1] 既存の mutated.png を再利用")
             img_generated = True
         else:
             prev_backview_path = OUTPUT_DIR / f"iteration_{iteration-1:03d}" / "backview.png"
             if iteration > 1 and prev_backview_path.exists():
-                # 2回目以降: img2img で前回のシルエットを変容させる
-                img_generated = generate_image_nano_banana(
-                    current_nouns, negations, mutated_path,
-                    input_image_path=prev_backview_path,
-                )
+                if COLAB_SERVER_URL:
+                    img_generated = generate_image_colab(
+                        current_nouns, negations, mutated_path,
+                        input_image_path=prev_backview_path,
+                    )
+                else:
+                    img_generated = generate_image_nano_banana(
+                        current_nouns, negations, mutated_path,
+                        input_image_path=prev_backview_path,
+                    )
                 if not img_generated:
-                    console.print("  [yellow]⚠ Nano Banana 2 (img2img) 失敗。サイクルをリトライします[/]")
-                    log.warning("Nano Banana 2 (img2img) 失敗。サイクルをリトライします")
+                    console.print("  [yellow]⚠ img2img 失敗。サイクルをリトライします[/]")
+                    log.warning("img2img 失敗")
             else:
-                # 初回 or 前回画像なし: txt2img で新規生成
-                img_generated = generate_image_nano_banana(current_nouns, negations, mutated_path)
+                if COLAB_SERVER_URL:
+                    img_generated = generate_image_colab(current_nouns, negations, mutated_path)
+                else:
+                    img_generated = generate_image_nano_banana(current_nouns, negations, mutated_path)
 
         if not img_generated:
             log.error("Step 1 (画像生成) 失敗")
@@ -1582,33 +1857,37 @@ def main():
                 console.print("  [red]✗ 入力画像 (mutated.png) が見つかりません[/]")
                 cycle_ok = False
             else:
-                sds_models = REPLICATE_SDS_MODELS
-                if not sds_models:
-                    sds_models = ["firtoz/trellis:e8f6c45206993f297372f5436b90350817bd9b4a0d52d2a76df50c1c8afa2b3c"]
-                
-                result = None
-                for attempt_idx in range(len(sds_models)):
-                    current_model_id = sds_models[(iteration - 1 + attempt_idx) % len(sds_models)]
-                    short_name = current_model_id.split("/")[1].split(":")[0]
-                    
-                    console.print(f"  [dim]🔄 3Dモデル: [bold]{short_name}[/] (Cycle {iteration}, 候補 {attempt_idx+1}/{len(sds_models)})[/]")
-                    log.info(f"[3D] 選択モデル: {current_model_id} (Cycle {iteration}, 候補 {attempt_idx+1}/{len(sds_models)})")
-                    
-                    result = generate_3d_replicate(
-                        mutated_path, glb_path,
-                        model_id=current_model_id,
-                        nouns=current_nouns,
-                    )
-                    
+                if COLAB_SERVER_URL:
+                    current_model_id = "colab/triposr"
+                    result = generate_3d_colab(mutated_path, glb_path, nouns=current_nouns)
                     if result:
-                        actual_model_path = Path(result)  # 正しい拡張子のパス
-                        break # 生成成功
+                        actual_model_path = Path(result)
                     else:
-                        console.print(f"  [yellow]⚠ {short_name} での生成に失敗しました。次のモデルを試します...[/]")
-                        
-                if not result:
-                    log.error("Step 2 (3D生成) 全モデルで失敗")
-                    cycle_ok = False
+                        log.error("Step 2 (3D生成) Colab TripoSR 失敗")
+                        cycle_ok = False
+                else:
+                    sds_models = REPLICATE_SDS_MODELS
+                    if not sds_models:
+                        sds_models = ["firtoz/trellis:e8f6c45206993f297372f5436b90350817bd9b4a0d52d2a76df50c1c8afa2b3c"]
+
+                    result = None
+                    for attempt_idx in range(len(sds_models)):
+                        current_model_id = sds_models[(iteration - 1 + attempt_idx) % len(sds_models)]
+                        short_name = current_model_id.split("/")[1].split(":")[0]
+                        console.print(f"  [dim]🔄 {short_name} (候補 {attempt_idx+1}/{len(sds_models)})[/]")
+                        result = generate_3d_replicate(
+                            mutated_path, glb_path,
+                            model_id=current_model_id,
+                            nouns=current_nouns,
+                        )
+                        if result:
+                            actual_model_path = Path(result)
+                            break
+                        console.print(f"  [yellow]⚠ {short_name} 失敗。次のモデルを試します...[/]")
+
+                    if not result:
+                        log.error("Step 2 (3D生成) 全モデルで失敗")
+                        cycle_ok = False
 
         # ── Step 3: Render backview ──
         if cycle_ok:
@@ -1633,7 +1912,10 @@ def main():
                 console.print("  [red]✗ backview画像が見つかりません[/]")
                 new_nouns = None
             else:
-                new_nouns = analyze_image_gemini(backview_path, negations, language=cycle_language)
+                if GEMINI_API_KEY:
+                    new_nouns = analyze_image_gemini_direct(backview_path, negations, language=cycle_language)
+                else:
+                    new_nouns = analyze_image_gemini(backview_path, negations, language=cycle_language)
         else:
             new_nouns = None
 
